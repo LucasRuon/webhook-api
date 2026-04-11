@@ -204,26 +204,49 @@ async def receive_webhook(slug: str, request: Request):
         body = await request.json()
         headers = dict(request.headers)
 
-        # Extrai campos configurados (suporta arrays: entry.0.changes.0.value)
+        # Extrai campos do payload
         fields_schema = json.loads(channel["fields_schema"])
         extracted = {}
-        for field in fields_schema:
-            key = field.get("key", "")
-            if key:
-                value = body
-                for part in key.split("."):
-                    if isinstance(value, dict):
-                        value = value.get(part)
-                    elif isinstance(value, list):
-                        try:
-                            value = value[int(part)]
-                        except (ValueError, IndexError):
+
+        if fields_schema:
+            # Modo manual: extrai campos configurados (suporta arrays: entry.0.changes.0.value)
+            for field in fields_schema:
+                key = field.get("key", "")
+                if key:
+                    value = body
+                    for part in key.split("."):
+                        if isinstance(value, dict):
+                            value = value.get(part)
+                        elif isinstance(value, list):
+                            try:
+                                value = value[int(part)]
+                            except (ValueError, IndexError):
+                                value = None
+                                break
+                        else:
                             value = None
                             break
-                    else:
-                        value = None
-                        break
-                extracted[key] = value
+                    extracted[key] = value
+        else:
+            # Modo auto: flatten automatico de todo o payload
+            def flatten(obj, prefix=""):
+                items = {}
+                if isinstance(obj, dict):
+                    for k, v in obj.items():
+                        path = f"{prefix}.{k}" if prefix else k
+                        if isinstance(v, (dict, list)):
+                            items.update(flatten(v, path))
+                        else:
+                            items[path] = v
+                elif isinstance(obj, list):
+                    for i, v in enumerate(obj):
+                        path = f"{prefix}.{i}"
+                        if isinstance(v, (dict, list)):
+                            items.update(flatten(v, path))
+                        else:
+                            items[path] = v
+                return items
+            extracted = flatten(body)
 
         # Publica no RabbitMQ se habilitado
         rabbit_published = False
