@@ -204,7 +204,7 @@ async def receive_webhook(slug: str, request: Request):
         body = await request.json()
         headers = dict(request.headers)
 
-        # Extrai campos configurados
+        # Extrai campos configurados (suporta arrays: entry.0.changes.0.value)
         fields_schema = json.loads(channel["fields_schema"])
         extracted = {}
         for field in fields_schema:
@@ -214,6 +214,12 @@ async def receive_webhook(slug: str, request: Request):
                 for part in key.split("."):
                     if isinstance(value, dict):
                         value = value.get(part)
+                    elif isinstance(value, list):
+                        try:
+                            value = value[int(part)]
+                        except (ValueError, IndexError):
+                            value = None
+                            break
                     else:
                         value = None
                         break
