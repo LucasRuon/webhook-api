@@ -28,6 +28,7 @@ async def init_db():
                 rabbit_exchange TEXT DEFAULT '',
                 rabbit_routing_key TEXT DEFAULT '',
                 rabbit_enabled INTEGER DEFAULT 0,
+                rabbit_filter TEXT DEFAULT '[]',
                 is_active INTEGER DEFAULT 1,
                 created_at TEXT DEFAULT (datetime('now'))
             );
@@ -40,43 +41,32 @@ async def init_db():
                 payload TEXT DEFAULT '{}',
                 extracted_fields TEXT DEFAULT '{}',
                 response_status INTEGER,
-                response_body TEXT DEFAULT '',
+                response_body TEXT,
                 rabbit_published INTEGER DEFAULT 0,
                 created_at TEXT DEFAULT (datetime('now')),
-                FOREIGN KEY (channel_id) REFERENCES channels(id)
+                FOREIGN KEY (channel_id) REFERENCES channels (id)
             );
 
-            CREATE INDEX IF NOT EXISTS idx_logs_channel ON webhook_logs(channel_id);
             CREATE INDEX IF NOT EXISTS idx_logs_created ON webhook_logs(created_at);
         """)
         await db.commit()
 
-        # Migração: adiciona colunas rabbit se tabela já existia
-        try:
-            await db.execute("ALTER TABLE channels ADD COLUMN rabbit_queue TEXT DEFAULT ''")
-            await db.commit()
-        except Exception:
-            pass
-        try:
-            await db.execute("ALTER TABLE channels ADD COLUMN rabbit_exchange TEXT DEFAULT ''")
-            await db.commit()
-        except Exception:
-            pass
-        try:
-            await db.execute("ALTER TABLE channels ADD COLUMN rabbit_routing_key TEXT DEFAULT ''")
-            await db.commit()
-        except Exception:
-            pass
-        try:
-            await db.execute("ALTER TABLE channels ADD COLUMN rabbit_enabled INTEGER DEFAULT 0")
-            await db.commit()
-        except Exception:
-            pass
-        try:
-            await db.execute("ALTER TABLE webhook_logs ADD COLUMN rabbit_published INTEGER DEFAULT 0")
-            await db.commit()
-        except Exception:
-            pass
+        # Migração: adiciona novas colunas se tabela já existia
+        migrations = [
+            ("channels", "rabbit_queue", "TEXT DEFAULT ''"),
+            ("channels", "rabbit_exchange", "TEXT DEFAULT ''"),
+            ("channels", "rabbit_routing_key", "TEXT DEFAULT ''"),
+            ("channels", "rabbit_enabled", "INTEGER DEFAULT 0"),
+            ("channels", "rabbit_filter", "TEXT DEFAULT '[]'"),
+            ("webhook_logs", "rabbit_published", "INTEGER DEFAULT 0")
+        ]
+        
+        for table, col, spec in migrations:
+            try:
+                await db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {spec}")
+                await db.commit()
+            except Exception:
+                pass
 
     finally:
         await db.close()

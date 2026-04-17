@@ -42,6 +42,7 @@ class ChannelCreate(BaseModel):
     rabbit_exchange: str = ""
     rabbit_routing_key: str = ""
     rabbit_enabled: bool = False
+    rabbit_filter: List[dict] = []
 
 
 class ChannelUpdate(BaseModel):
@@ -54,6 +55,7 @@ class ChannelUpdate(BaseModel):
     rabbit_exchange: Optional[str] = None
     rabbit_routing_key: Optional[str] = None
     rabbit_enabled: Optional[bool] = None
+    rabbit_filter: Optional[List[dict]] = None
     is_active: Optional[bool] = None
 
 
@@ -81,12 +83,12 @@ async def create_channel(channel: ChannelCreate, request: Request):
         await db.execute(
             """INSERT INTO channels
                (name, slug, description, fields_schema, secret, target_url,
-                rabbit_queue, rabbit_exchange, rabbit_routing_key, rabbit_enabled)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                rabbit_queue, rabbit_exchange, rabbit_routing_key, rabbit_enabled, rabbit_filter)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (channel.name, channel.slug, channel.description,
              json.dumps(channel.fields_schema), channel.secret, channel.target_url,
              channel.rabbit_queue, channel.rabbit_exchange, channel.rabbit_routing_key,
-             1 if channel.rabbit_enabled else 0),
+             1 if channel.rabbit_enabled else 0, json.dumps(channel.rabbit_filter)),
         )
         await db.commit()
         return {"status": "ok", "slug": channel.slug}
@@ -102,7 +104,11 @@ async def list_channels(request: Request):
         cursor = await db.execute("SELECT * FROM channels ORDER BY created_at DESC")
         rows = await cursor.fetchall()
         return [
-            {**dict(row), "fields_schema": json.loads(row["fields_schema"])}
+            {
+                **dict(row),
+                "fields_schema": json.loads(row["fields_schema"]),
+                "rabbit_filter": json.loads(row.get("rabbit_filter", "[]"))
+            }
             for row in rows
         ]
     finally:
@@ -118,7 +124,11 @@ async def get_channel(slug: str, request: Request):
         row = await cursor.fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Canal nao encontrado")
-        return {**dict(row), "fields_schema": json.loads(row["fields_schema"])}
+        return {
+            **dict(row),
+            "fields_schema": json.loads(row["fields_schema"]),
+            "rabbit_filter": json.loads(row.get("rabbit_filter", "[]"))
+        }
     finally:
         await db.close()
 
@@ -152,6 +162,8 @@ async def update_channel(slug: str, update: ChannelUpdate, request: Request):
             fields["rabbit_routing_key"] = update.rabbit_routing_key
         if update.rabbit_enabled is not None:
             fields["rabbit_enabled"] = 1 if update.rabbit_enabled else 0
+        if update.rabbit_filter is not None:
+            fields["rabbit_filter"] = json.dumps(update.rabbit_filter)
         if update.is_active is not None:
             fields["is_active"] = 1 if update.is_active else 0
 
@@ -184,6 +196,54 @@ async def delete_channel(slug: str, request: Request):
 # ──────────────────────────────────────
 #  RECEBER WEBHOOK  →  POST /w/{slug}
 # ──────────────────────────────────────
+def evaluate_filter(payload: dict, filter_criteria: List[dict]) -> bool:
+    """Avalia se o payload atende aos criterios de filtro."""
+    if not filter_criteria:
+        return True
+
+    for criterion in filter_criteria:
+        key = criterion.get("key", "")
+        expected_value = criterion.get("value")
+        op = criterion.get("op", "eq")
+
+        if not key:
+            continue
+
+        # Extrai o valor atual do payload
+        actual_value = payload
+        for part in key.split("."):
+            if isinstance(actual_value, dict):
+                actual_value = actual_value.get(part)
+            elif isinstance(actual_value, list):
+                try:
+                    actual_value = actual_value[int(part)]
+                except (ValueError, IndexError):
+                    actual_value = None
+                    break
+            else:
+                actual_value = None
+                break
+
+        # Compara baseado no operador
+        if op == "eq":
+            if str(actual_value) != str(expected_value):
+                return False
+        elif op == "ne":
+            if str(actual_value) == str(expected_value):
+                return False
+        elif op == "contains":
+            if str(expected_value) not in str(actual_value or ""):
+                return False
+        elif op == "exists":
+            if actual_value is None:
+                return False
+        elif op == "not_exists":
+            if actual_value is not None:
+                return False
+
+    return True
+
+
 @app.post("/w/{slug}")
 async def receive_webhook(slug: str, request: Request):
     db = await get_db()
@@ -248,22 +308,32 @@ async def receive_webhook(slug: str, request: Request):
                 return items
             extracted = flatten(body)
 
-        # Publica no RabbitMQ se habilitado
+        # Publica no RabbitMQ se habilitado E se passar no filtro
         rabbit_published = False
         if channel["rabbit_enabled"]:
-            queue = channel["rabbit_queue"] or RABBITMQ_QUEUE
-            message = {
-                "channel": slug,
-                "received_at": datetime.now(timezone.utc).isoformat(),
-                "payload": body,
-                "extracted": extracted,
-            }
-            rabbit_published = await rabbitmq.publish(
-                exchange_name=channel["rabbit_exchange"],
-                routing_key=channel["rabbit_routing_key"],
-                queue_name=queue,
-                message=message,
+            # Filtro obrigatorio: deve conter source_id (na raiz ou dentro de referral)
+            has_source_id = "source_id" in body or (
+                isinstance(body.get("referral"), dict) and "source_id" in body["referral"]
             )
+
+            if has_source_id:
+                filter_criteria = json.loads(channel.get("rabbit_filter", "[]"))
+                should_publish = evaluate_filter(body, filter_criteria)
+
+                if should_publish:
+                    queue = channel["rabbit_queue"] or RABBITMQ_QUEUE
+                    message = {
+                        "channel": slug,
+                        "received_at": datetime.now(timezone.utc).isoformat(),
+                        "payload": body,
+                        "extracted": extracted,
+                    }
+                    rabbit_published = await rabbitmq.publish(
+                        exchange_name=channel["rabbit_exchange"],
+                        routing_key=channel["rabbit_routing_key"],
+                        queue_name=queue,
+                        message=message,
+                    )
 
         await db.execute(
             """INSERT INTO webhook_logs
@@ -510,6 +580,14 @@ ADMIN_HTML = r"""<!DOCTYPE html>
         <input type="checkbox" id="new-rabbit-enabled" checked>
         <label for="new-rabbit-enabled">Publicar no RabbitMQ ao receber webhook</label>
       </div>
+
+      <div class="form-group">
+        <label>Filtros (opcional)</label>
+        <p style="color:#64748b;font-size:12px;margin-bottom:8px">Envie apenas se atender aos criterios. Operadores: eq, ne, contains, exists, not_exists</p>
+        <div id="new-filters"></div>
+        <button class="btn btn-sm btn-primary" onclick="addFilterRow('new-filters')">+ Filtro</button>
+      </div>
+
       <div class="form-group"><label>Fila (queue) — vazio usa a fila padrao da env RABBITMQ_QUEUE</label><input id="new-rabbit-queue" placeholder="Ex: webhooks.stripe"></div>
       <div class="form-group"><label>Exchange (vazio = default exchange)</label><input id="new-rabbit-exchange" placeholder="Ex: webhooks"></div>
       <div class="form-group"><label>Routing Key (vazio = nome da fila)</label><input id="new-rabbit-routing" placeholder="Ex: payments.received"></div>
@@ -639,6 +717,28 @@ async function openChannel(slug) {
         <input type="checkbox" id="edit-rabbit-enabled" ${ch.rabbit_enabled ? 'checked' : ''}>
         <label for="edit-rabbit-enabled">Publicar no RabbitMQ</label>
       </div>
+
+      <div class="form-group">
+        <label>Filtros (opcional)</label>
+        <div id="edit-filters">
+          ${(ch.rabbit_filter || []).map((f, i) => `
+            <div class="field-row filter-row">
+              <input value="${f.key}" placeholder="Caminho">
+              <select style="width:100px;background:#0f172a;color:white;border:1px solid #334155;border-radius:6px;padding:4px">
+                <option value="eq" ${f.op === 'eq' ? 'selected' : ''}>eq</option>
+                <option value="ne" ${f.op === 'ne' ? 'selected' : ''}>ne</option>
+                <option value="contains" ${f.op === 'contains' ? 'selected' : ''}>contains</option>
+                <option value="exists" ${f.op === 'exists' ? 'selected' : ''}>exists</option>
+                <option value="not_exists" ${f.op === 'not_exists' ? 'selected' : ''}>!exists</option>
+              </select>
+              <input value="${f.value || ''}" placeholder="Valor">
+              <button class="btn btn-danger btn-sm" onclick="this.parentElement.remove()">x</button>
+            </div>
+          `).join('')}
+        </div>
+        <button class="btn btn-sm btn-primary" onclick="addFilterRow('edit-filters')">+ Filtro</button>
+      </div>
+
       <div class="form-group"><label>Fila (queue) — vazio usa padrao</label><input id="edit-rabbit-queue" value="${ch.rabbit_queue || ''}"></div>
       <div class="form-group"><label>Exchange</label><input id="edit-rabbit-exchange" value="${ch.rabbit_exchange || ''}"></div>
       <div class="form-group"><label>Routing Key</label><input id="edit-rabbit-routing" value="${ch.rabbit_routing_key || ''}"></div>
@@ -689,11 +789,39 @@ function addFieldRow(containerId) {
   div.appendChild(row);
 }
 
+function addFilterRow(containerId) {
+  const div = document.getElementById(containerId);
+  const row = document.createElement('div');
+  row.className = 'field-row filter-row';
+  row.innerHTML = `
+    <input placeholder="Caminho (ex: type)">
+    <select style="width:100px;background:#0f172a;color:white;border:1px solid #334155;border-radius:6px;padding:4px">
+      <option value="eq">eq</option>
+      <option value="ne">ne</option>
+      <option value="contains">contains</option>
+      <option value="exists">exists</option>
+      <option value="not_exists">!exists</option>
+    </select>
+    <input placeholder="Valor esperado">
+    <button class="btn btn-danger btn-sm" onclick="this.parentElement.remove()">x</button>
+  `;
+  div.appendChild(row);
+}
+
 function getFields(containerId) {
-  const rows = document.getElementById(containerId).querySelectorAll('.field-row');
+  const rows = document.getElementById(containerId).querySelectorAll('.field-row:not(.filter-row)');
   return Array.from(rows).map(row => {
     const inputs = row.querySelectorAll('input');
     return { key: inputs[0].value.trim(), label: inputs[1]?.value.trim() || '' };
+  }).filter(f => f.key);
+}
+
+function getFilters(containerId) {
+  const rows = document.getElementById(containerId).querySelectorAll('.filter-row');
+  return Array.from(rows).map(row => {
+    const inputs = row.querySelectorAll('input');
+    const select = row.querySelector('select');
+    return { key: inputs[0].value.trim(), op: select.value, value: inputs[1]?.value.trim() || '' };
   }).filter(f => f.key);
 }
 
@@ -706,6 +834,7 @@ async function saveChannel(slug) {
       rabbit_queue: document.getElementById('edit-rabbit-queue').value,
       rabbit_exchange: document.getElementById('edit-rabbit-exchange').value,
       rabbit_routing_key: document.getElementById('edit-rabbit-routing').value,
+      rabbit_filter: getFilters('edit-filters'),
     }),
   });
   openChannel(slug);
@@ -725,6 +854,7 @@ async function createChannel() {
       rabbit_queue: document.getElementById('new-rabbit-queue').value,
       rabbit_exchange: document.getElementById('new-rabbit-exchange').value,
       rabbit_routing_key: document.getElementById('new-rabbit-routing').value,
+      rabbit_filter: getFilters('new-filters'),
     }),
   });
   showTab('channels');
