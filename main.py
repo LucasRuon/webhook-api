@@ -107,7 +107,7 @@ async def list_channels(request: Request):
             {
                 **dict(row),
                 "fields_schema": json.loads(row["fields_schema"]),
-                "rabbit_filter": json.loads(row.get("rabbit_filter", "[]"))
+                "rabbit_filter": json.loads(row["rabbit_filter"] if "rabbit_filter" in row.keys() else "[]")
             }
             for row in rows
         ]
@@ -127,7 +127,7 @@ async def get_channel(slug: str, request: Request):
         return {
             **dict(row),
             "fields_schema": json.loads(row["fields_schema"]),
-            "rabbit_filter": json.loads(row.get("rabbit_filter", "[]"))
+            "rabbit_filter": json.loads(row["rabbit_filter"] if "rabbit_filter" in row.keys() else "[]")
         }
     finally:
         await db.close()
