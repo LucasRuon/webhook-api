@@ -312,12 +312,17 @@ async def receive_webhook(slug: str, request: Request):
         rabbit_published = False
         if channel["rabbit_enabled"]:
             # Filtro obrigatorio: deve conter source_id (na raiz ou dentro de referral)
-            has_source_id = "source_id" in body or (
-                isinstance(body.get("referral"), dict) and "source_id" in body["referral"]
-            )
+            def find_source_id(obj):
+                if isinstance(obj, dict):
+                    if "source_id" in obj: return True
+                    if isinstance(obj.get("referral"), dict) and "source_id" in obj["referral"]: return True
+                elif isinstance(obj, list):
+                    return any(find_source_id(item) for item in obj)
+                return False
 
-            if has_source_id:
-                filter_criteria = json.loads(channel.get("rabbit_filter", "[]"))
+            if find_source_id(body):
+                raw_filter = channel["rabbit_filter"] if "rabbit_filter" in channel.keys() else "[]"
+                filter_criteria = json.loads(raw_filter)
                 should_publish = evaluate_filter(body, filter_criteria)
 
                 if should_publish:
